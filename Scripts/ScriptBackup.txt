@@ -1,0 +1,75 @@
+#!/bin/bash
+
+# ==========================================
+# 1. CONFIGURACIÓ DE VARIABLES
+# ==========================================
+DATA=$(date +%Y-%m-%d)
+HORA=$(date +%H:%M:%S)
+DIA_SETMANA=$(date +%u) # 1=Dilluns, 7=Diumenge
+DESTINO="/mnt/nas_odoo"
+LOG="/var/log/backup_odoo.log"
+DB_NAME="enviamentexpress"
+RUTES_A_COPIAR="/opt/odoo" # On està el codi i odoo.conf
+
+#  CONFIGURACIÓ D'AMAZON AWS S3
+BUCKET_NAME="backup-enviamentexpress"
+# ==========================================
+# 2. SELECCIÓ DE TIPUS DE CÒPIA
+# ==========================================
+if [ $DIA_SETMANA -eq 7 ]; then
+    TIPO="completes"
+else
+    TIPO="incrementals"
+fi
+
+RUTA_FINAL="$DESTINO/$TIPO/$DATA"
+
+# ==========================================
+# 3. PREPARACIÓ DE L'ENTORN
+# ==========================================
+mkdir -p "$DESTINO/completes" "$DESTINO/incrementals"
+mkdir -p "$RUTA_FINAL"
+echo "--- [$DATA $HORA] INICI COPIA ($TIPO) ---" >> $LOG
+
+# ==========================================
+# 4. BACKUP DE LA BASE DE DADES (PostgreSQL)
+# ==========================================
+echo "[$HORA] Realitzant dump de PostgreSQL..." >> $LOG
+cd /tmp
+sudo -u postgres pg_dump $DB_NAME > db_temp_$DATA.sql 2>> $LOG
+
+if [ $? -eq 0 ]; then
+    mv db_temp_$DATA.sql "$RUTA_FINAL/db_express_$DATA.sql"
+    echo "[$HORA] Base de dades copiada amb èxit al NAS." >> $LOG
+else
+    echo "[$HORA] ERROR en el dump de la base de dades." >> $LOG
+fi
+
+# ==========================================
+# 5. BACKUP DELS FITXERS (Odoo Filestore i Config)
+# ==========================================
+echo "[$HORA] Sincronitzant fitxers /opt/odoo..." >> $LOG
+rsync -avz $RUTES_A_COPIAR "$RUTA_FINAL/" >> $LOG 2>&1
+
+# ==========================================
+# 5.5.  REPLICACIÓ AUTOMÀTICA A LA NÚVOL (AWS S3)
+# ==========================================
+echo "[$HORA] Sincronitzant estructures del NAS amb AWS S3 (eu-north-1)..." >> $LOG
+
+# Utilitzem la ruta absoluta de Snap perquè cron trobi el comando 'aws'
+/snap/bin/aws s3 sync "$DESTINO/" "s3://$BUCKET_NAME/" >> $LOG 2>&1
+
+if [ $? -eq 0 ]; then
+    echo "[$HORA] Replicació a AWS S3 completada correctament." >> $LOG
+else
+    echo "[$HORA] ERROR o avisos durant la pujada a AWS S3." >> $LOG
+fi
+
+# ==========================================
+# 6. NETEJA AUTOMÀTICA (Manteniment de l'espai)
+# ==========================================
+find "$DESTINO/incrementals/" -mindepth 1 -type d -mtime +21 -exec rm -rf {} +
+find "$DESTINO/completes/" -mindepth 1 -type d -mtime +60 -exec rm -rf {} +
+
+echo "--- [$DATA $HORA] FINALITZAT AMB ÈXIT ---" >> $LOG
+echo "------------------------------------------------" >> $LOG
